@@ -165,6 +165,13 @@ class LSTM_FCN(SupervisedLearnerPrimitiveBase[Inputs, Outputs, Params, Hyperpara
         grouping_column = input_metadata.list_columns_with_semantic_types(('https://metadata.datadrivendiscovery.org/types/GroupingKey',))
         return grouping_column
 
+    def _get_value_col(self, input_metadata):
+        # find attribute column but not file column
+        attributes = input_metadata.list_columns_with_semantic_types(('https://metadata.datadrivendiscovery.org/types/Attribute',))
+        # this is assuming alot, but timeseries formaters typicaly place value column at the end
+        attribute_col = attributes[-1]
+        return attribute_col
+
     def set_training_data(self, *, inputs: Inputs, outputs: Outputs) -> None:
         '''
         Sets primitive's training data
@@ -182,7 +189,8 @@ class LSTM_FCN(SupervisedLearnerPrimitiveBase[Inputs, Outputs, Params, Hyperpara
         n_ts = outputs.shape[0]
         ts_sz = inputs.shape[0] // n_ts
 
-        self._X_train = inputs.value.values.reshape(n_ts, 1, ts_sz) 
+        attribute_col = self._get_value_col(inputs.metadata)
+        self._X_train = inputs.iloc[:, attribute_col].values.reshape(n_ts, 1, ts_sz)
         y_train = np.array(outputs)
 
         # encode labels and convert to categorical
