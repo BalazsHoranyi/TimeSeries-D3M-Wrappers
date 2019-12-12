@@ -327,7 +327,8 @@ class LSTM_FCN(SupervisedLearnerPrimitiveBase[Inputs, Outputs, Params, Hyperpara
 
         n_ts = inputs.iloc[:, grouping_column[0]].nunique()
         ts_sz = inputs.shape[0] // n_ts
-        x_vals = inputs.value.values.reshape(n_ts, 1, ts_sz)
+        attribute_col = self._get_value_col(inputs.metadata)
+        x_vals = inputs.iloc[:, attribute_col].values.reshape(n_ts, 1, ts_sz)
         test_dataset = LSTMSequenceTest(x_vals, self.hyperparams['batch_size'])
 
         # make predictions
