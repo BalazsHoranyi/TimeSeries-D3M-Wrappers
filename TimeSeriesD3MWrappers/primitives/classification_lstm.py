@@ -166,6 +166,16 @@ class LSTM_FCN(SupervisedLearnerPrimitiveBase[Inputs, Outputs, Params, Hyperpara
         return grouping_column
 
     def _get_value_col(self, input_metadata):
+        """
+        private util function that finds the value column from input metadata
+
+        Arguments:
+        input_metadata {D3M Metadata object} -- D3M Metadata object for input frame
+
+        Returns:
+        int -- index of column that contains time series value after Time Series Formatter primitive
+        """
+
         # find attribute column but not file column
         attributes = input_metadata.list_columns_with_semantic_types(('https://metadata.datadrivendiscovery.org/types/Attribute',))
         # this is assuming alot, but timeseries formaters typicaly place value column at the end
