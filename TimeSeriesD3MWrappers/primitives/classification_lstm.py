@@ -46,7 +46,7 @@ class Hyperparams(hyperparams.Hyperparams):
     epochs = hyperparams.UniformInt(
         lower = 1, 
         upper = sys.maxsize, 
-        default = 5000, 
+        default = 5000,
         semantic_types=['https://metadata.datadrivendiscovery.org/types/TuningParameter'], 
         description = 'number of training epochs')
     learning_rate = hyperparams.Uniform(
@@ -339,6 +339,7 @@ class LSTM_FCN(SupervisedLearnerPrimitiveBase[Inputs, Outputs, Params, Hyperpara
         ts_sz = inputs.shape[0] // n_ts
         attribute_col = self._get_value_col(inputs.metadata)
         x_vals = inputs.iloc[:, attribute_col].values.reshape(n_ts, 1, ts_sz)
+        x_vals = tf.cast(x_vals, tf.float32)
         test_dataset = LSTMSequenceTest(x_vals, self.hyperparams['batch_size'])
 
         # make predictions
