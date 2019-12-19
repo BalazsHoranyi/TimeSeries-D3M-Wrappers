@@ -57,7 +57,7 @@ step_2.add_argument(
 step_2.add_output("produce")
 pipeline_description.add_step(step_2)
 
-# Step 3: forecasting primitive
+# Step 3: forecasting primitive produce_weights method
 step_3 = PrimitiveStep(
     primitive=index.get_primitive(
         "d3m.primitives.time_series_forecasting.vector_autoregression.VAR"
@@ -73,12 +73,12 @@ step_3.add_argument(
     argument_type=ArgumentType.CONTAINER,
     data_reference="steps.2.produce",
 )
-step_3.add_output("produce")
+step_3.add_output("produce_weights")
 pipeline_description.add_step(step_3)
 
 # Final Output
 pipeline_description.add_output(
-    name="output predictions", data_reference="steps.3.produce"
+    name="aggregated regression coefficients", data_reference="steps.3.produce_weights"
 )
 
 # Output json pipeline
