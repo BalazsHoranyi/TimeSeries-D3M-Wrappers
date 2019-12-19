@@ -33,6 +33,34 @@ __contact__ = "mailto:jeffrey.gleason@yonder.co"
 Inputs = container.pandas.DataFrame
 Outputs = container.pandas.DataFrame
 
+# define time constants
+SECONDS_PER_MINUTE = 60
+MINUTES_PER_HOUR = 60
+HOURS_PER_DAY = 24
+DAYS_PER_WEEK = 7
+DAYS_PER_MONTH = [28, 30, 31]
+DAYS_PER_YEAR = [365, 366]
+
+S_PER_YEAR_0 = (
+    SECONDS_PER_MINUTE * MINUTES_PER_HOUR * HOURS_PER_DAY * DAYS_PER_YEAR[0]
+)
+S_PER_YEAR_1 = (
+    SECONDS_PER_MINUTE * MINUTES_PER_HOUR * HOURS_PER_DAY * DAYS_PER_YEAR[1]
+)
+S_PER_MONTH_28 = (
+    SECONDS_PER_MINUTE * MINUTES_PER_HOUR * HOURS_PER_DAY * DAYS_PER_MONTH[0]
+)
+S_PER_MONTH_30 = (
+    SECONDS_PER_MINUTE * MINUTES_PER_HOUR * HOURS_PER_DAY * DAYS_PER_MONTH[1]
+)
+S_PER_MONTH_31 = (
+    SECONDS_PER_MINUTE * MINUTES_PER_HOUR * HOURS_PER_DAY * DAYS_PER_MONTH[2]
+)
+S_PER_WEEK = SECONDS_PER_MINUTE * MINUTES_PER_HOUR * HOURS_PER_DAY * DAYS_PER_WEEK
+S_PER_DAY = SECONDS_PER_MINUTE * MINUTES_PER_HOUR * HOURS_PER_DAY
+S_PER_HR = SECONDS_PER_MINUTE * MINUTES_PER_HOUR
+
+MAX_INT = np.finfo('d').max - 1
 
 class Params(params.Params):
     pass
@@ -41,13 +69,13 @@ class Params(params.Params):
 class Hyperparams(hyperparams.Hyperparams):
     max_lag_order = hyperparams.Union[typing.Union[int, None]](
         configuration=collections.OrderedDict(
-            user_selected=hyperparams.UniformInt(lower=0, upper=100, default=1,),
+            user_selected=hyperparams.UniformInt(lower=0, upper=100, default=1),
             auto_selected=hyperparams.Hyperparameter[None](
                 default=None,
                 description="Lag order of regressions automatically selected",
             ),
         ),
-        default="auto_selected",
+        default="user_selected",
         description="The lag order to apply to regressions. If user-selected, the same lag will be \
             applied to all regressions. If auto-selected, different lags can be selected for different \
             regressions.",
@@ -74,11 +102,18 @@ class Hyperparams(hyperparams.Hyperparams):
     seasonal_differencing = hyperparams.UniformInt(
         lower=1,
         upper=365,
-        default=11,
+        default=1,
         semantic_types=[
             "https://metadata.datadrivendiscovery.org/types/ControlParameter"
         ],
         description="period of seasonal differencing to use in ARIMA prediction",
+    )
+    dynamic = hyperparams.UniformBool(
+        default=True,
+        semantic_types=[
+            "https://metadata.datadrivendiscovery.org/types/ControlParameter"
+        ],
+        description="whether to perform dynamic in-sample prediction with ARIMA model",
     )
     interpret_value = hyperparams.Enumeration(
         default="lag_order",
@@ -192,6 +227,7 @@ class VAR(SupervisedLearnerPrimitiveBase[Inputs, Outputs, Params, Hyperparams]):
         self.categories = None
 
         # information about interpolation
+        self.freq = None
         self.interpolation_ranges = None
 
         # data needed to fit model and reconstruct predictions
@@ -201,7 +237,6 @@ class VAR(SupervisedLearnerPrimitiveBase[Inputs, Outputs, Params, Hyperparams]):
         self._lag_order = []
         self._values = None
         self._fits = []
-        self._final_logs = None
         self._is_fit = False
 
     def get_params(self) -> Params:
@@ -220,7 +255,6 @@ class VAR(SupervisedLearnerPrimitiveBase[Inputs, Outputs, Params, Hyperparams]):
             Raises:
                 ValueError: If multiple columns are annotated with 'Time' or 'DateTime' metadata
         """
-
         # make copy of input data!
         inputs_copy = inputs.copy()
 
@@ -250,6 +284,9 @@ class VAR(SupervisedLearnerPrimitiveBase[Inputs, Outputs, Params, Hyperparams]):
             inputs_copy[self.time_column] = pd.to_datetime(
                 inputs_copy[self.time_column], unit="s"
             )
+
+        # sort by time column
+        inputs_copy = inputs_copy.sort_values(by = [self.time_column])
 
         # mark key and grp variables
         self.key = inputs_copy.metadata.get_columns_with_semantic_type(
@@ -309,6 +346,7 @@ class VAR(SupervisedLearnerPrimitiveBase[Inputs, Outputs, Params, Hyperparams]):
                 inputs_copy = inputs_copy.set_index(self.time_column)
 
             # interpolate
+            self.freq = self._calculate_time_frequency(inputs_copy.index[1] - inputs_copy.index[0])
             inputs_copy = inputs_copy.interpolate(method="time", limit_direction="both")
 
             # set X train and target idxs
@@ -332,19 +370,22 @@ class VAR(SupervisedLearnerPrimitiveBase[Inputs, Outputs, Params, Hyperparams]):
                 self._X_train_names = [[]]
             else:
                 self.interpolation_ranges = inputs_copy.groupby(
-                    self.filter_idxs[0]
+                    self.filter_idxs[:-1]
                 ).agg({self.time_column: ["min", "max"]})
-                self._X_train = [None for i in range(min(grouping_keys_counts))]
-                self._X_train_names = [[] for i in range(min(grouping_keys_counts))]
-
+                self._X_train = [None for i in range(self.interpolation_ranges.shape[0])]
+                self._X_train_names = [[] for i in range(self.interpolation_ranges.shape[0])]
+            
             for name, group in inputs_copy.groupby(self.filter_idxs):
-                group_value = group[self.filter_idxs[0]].values[0]
-                if len(grouping_keys) == 1:
-                    training_idx = 0
+                if len(grouping_keys) > 2:
+                    group_value = tuple([group[self.filter_idxs[i]].values[0] for i in range(len(self.filter_idxs) - 1)])
                 else:
+                    group_value = group[self.filter_idxs[0]].values[0]
+                if len(grouping_keys) > 1:
                     training_idx = np.where(
-                        self.interpolation_ranges.index == group_value
-                    )[0][0]
+                            self.interpolation_ranges.index.to_flat_index() == group_value
+                        )[0][0]
+                else:
+                    training_idx = 0
                 group = group.drop(columns=self.filter_idxs)
 
                 # avg across duplicated time indices if necessary and re-index
@@ -360,7 +401,13 @@ class VAR(SupervisedLearnerPrimitiveBase[Inputs, Outputs, Params, Hyperparams]):
                 max_date = self.interpolation_ranges.loc[group_value][self.time_column][
                     "max"
                 ]
-                group = group.reindex(pd.date_range(min_date, max_date))
+                # assume frequency is the same across all time series
+                if self.freq is None:
+                    self.freq = self._calculate_time_frequency(group.index[1] - group.index[0])
+                group = group.reindex(
+                    pd.date_range(min_date, max_date, freq = self.freq), 
+                    tolerance = '1' + self.freq, 
+                    method = 'nearest')
                 group = group.interpolate(method="time", limit_direction="both")
 
                 # add to training data under appropriate top-level grouping key
@@ -391,20 +438,12 @@ class VAR(SupervisedLearnerPrimitiveBase[Inputs, Outputs, Params, Hyperparams]):
                 CallResult[None]
         """
 
-        # log transformation
-        self._mins = [
-            sequence.values.min() if sequence.values.min() < 1 else 1
-            for sequence in self._X_train
-        ]
-        self._values = [
-            sequence.apply(lambda x: x - min + 1)
-            for sequence, min in zip(self._X_train, self._mins)
-        ]
-        self._values = [np.log(sequence.values) for sequence in self._values]
-        self._final_logs = [sequence[-1:,] for sequence in self._values]
+        # mark if data is exclusively positive
+        self._values = [sequence.values for sequence in self._X_train]
+        self._positive = [True if np.min(vals) < 0 else False for vals in self._values]
 
-        # differencing transformation
-        self._values = [np.diff(sequence, axis=0) for sequence in self._values]
+        # difference data - VAR assumes data is stationary
+        self._values_diff = [np.diff(sequence,axis=0) for sequence in self._X_train]
 
         # define models
         if self.hyperparams["max_lag_order"] is None:
@@ -418,12 +457,13 @@ class VAR(SupervisedLearnerPrimitiveBase[Inputs, Outputs, Params, Hyperparams]):
                 seasonal=self.hyperparams["seasonal"],
                 seasonal_differencing=self.hyperparams["seasonal_differencing"],
                 max_order=arima_max_order,
+                dynamic = self.hyperparams['dynamic']
             )
-            for vals, original in zip(self._values, self._X_train)
+            for vals, original in zip(self._values_diff, self._X_train)
         ]
 
         # fit models
-        for vals, model, original in zip(self._values, self.models, self._X_train):
+        for vals, model, original in zip(self._values_diff, self.models, self._X_train):
 
             # VAR
             if vals.shape[1] > 1:
@@ -439,8 +479,11 @@ class VAR(SupervisedLearnerPrimitiveBase[Inputs, Outputs, Params, Hyperparams]):
                 except np.linalg.LinAlgError:
                     lags = self.hyperparams["default_lag_order"]
                     logger.debug(
-                        f"Matrix decomposition error. Using default lag order of {lags}"
+                        f"Matrix decomposition error (maybe redundant columns in this grouping). Using default lag order of {lags}"
                     )
+                except ValueError as e:
+                    lags = 0
+                    logger.debug('ValueError: ' + str(e) + '. Using lag order of 0')
                 self._lag_order.append(lags)
                 self._fits.append(model.fit(maxlags=lags))
 
@@ -487,28 +530,25 @@ class VAR(SupervisedLearnerPrimitiveBase[Inputs, Outputs, Params, Hyperparams]):
         intervals = [None for i in range(len(self._X_train))]
         d3m_indices = [None for i in range(len(self._X_train))]
         for _, group in group_tuple:
-            if grouping_key_ct > 1:
-                group_value = group[self.filter_idxs[0]].values[0]
-                testing_idx = np.where(self.interpolation_ranges.index == group_value)[
-                    0
-                ][0]
+            if grouping_key_ct > 2:
+                group_value = tuple([group[self.filter_idxs[i]].values[0] for i in range(len(self.filter_idxs) - 1)])
+                testing_idx = np.where(
+                    self.interpolation_ranges.index.to_flat_index() == group_value
+                )[0][0]
             else:
                 testing_idx = 0
-            max_train_idx = self._X_train[testing_idx].index[-1]
+            min_train_idx = self._X_train[testing_idx].index[0]
             time_diff = (
-                max_train_idx - self._X_train[testing_idx].index[-2]
+                self._X_train[testing_idx].index[1] - min_train_idx
             ).total_seconds()
             local_intervals = self._discretize_time_difference(
-                group[self.time_column], max_train_idx, time_diff
+                group[self.time_column], min_train_idx, self.freq
             )
 
-            # TODO: could grab training values for series who have index before max)
-            local_intervals = [int(l - 1) if l > 0 else 0 for l in local_intervals]
-            idxs = group.iloc[:, self.key[0]].values
-
             # save n_periods prediction information
-            if n_periods[testing_idx] < max(local_intervals) + 1:
-                n_periods[testing_idx] = int(max(local_intervals) + 1)
+            num_p = int(max(local_intervals) - self._X_train[testing_idx].shape[0] + 1)
+            if n_periods[testing_idx] < num_p:
+                n_periods[testing_idx] = num_p
 
             # save interval prediction information
             if intervals[testing_idx] is None:
@@ -517,6 +557,7 @@ class VAR(SupervisedLearnerPrimitiveBase[Inputs, Outputs, Params, Hyperparams]):
                 intervals[testing_idx].append(local_intervals)
 
             # save d3m indices prediction information
+            idxs = group.iloc[:, self.key[0]].values
             if d3m_indices[testing_idx] is None:
                 d3m_indices[testing_idx] = [idxs]
             else:
@@ -525,8 +566,49 @@ class VAR(SupervisedLearnerPrimitiveBase[Inputs, Outputs, Params, Hyperparams]):
         return n_periods, intervals, d3m_indices
 
     @classmethod
+    def _calculate_time_frequency(
+        cls, time_diff
+    ):
+        """method that calculates the frequency of a datetime difference (for prediction slices) 
+        
+            Arguments:
+                time_diff {timedelta} -- difference between two instances
+            
+            Returns:
+                str -- string alias representing granularity of pd.datetime object
+        """
+        time_diff = time_diff.total_seconds()
+        if time_diff % S_PER_YEAR_0 == 0:
+            logger.debug("granularity is years")
+            return 'YS'
+        elif time_diff % S_PER_YEAR_1 == 0:
+            logger.debug("granularity is years")
+            return 'YS'
+        elif time_diff % S_PER_MONTH_31 == 0:
+            logger.debug("granularity is months 31")
+            return 'M'
+        elif time_diff % S_PER_MONTH_30 == 0:
+            logger.debug("granularity is months 30")
+            return 'M'
+        elif time_diff % S_PER_MONTH_28 == 0:
+            logger.debug("granularity is months 28")
+            return 'M'
+        elif time_diff % S_PER_WEEK == 0:
+            logger.debug("granularity is weeks")
+            return 'W'
+        elif time_diff % S_PER_DAY == 0:
+            logger.debug("granularity is days")
+            return 'D'
+        elif time_diff % S_PER_HR == 0:
+            logger.debug("granularity is hours")
+            return 'H'
+        else:
+            logger.debug("granularity is seconds")
+            return 'S'
+
+    @classmethod
     def _discretize_time_difference(
-        cls, times, initial_time, time_diff
+        cls, times, initial_time, frequency
     ) -> typing.Sequence[int]:
         """method that discretizes sequence of datetimes (for prediction slices) 
         
@@ -534,66 +616,29 @@ class VAR(SupervisedLearnerPrimitiveBase[Inputs, Outputs, Params, Hyperparams]):
                 times {Sequence[datetime]} -- sequence of datetime objects
                 initial_time {datetime} -- last datetime instance from training set 
                     (to offset test datetimes)
-                time_diff {timedelta} -- difference between last and second to last datetime instances
-                    in training set, used to calculate granularity for discretization
+                frequency {str} -- string alias representing granularity of pd.datetime object
             
             Returns:
                 typing.Sequence[int] -- prediction intervals expressed at specific time granularity
+
         """
-
-        SECONDS_PER_MINUTE = 60
-        MINUTES_PER_HOUR = 60
-        HOURS_PER_DAY = 24
-        DAYS_PER_WEEK = 7
-        DAYS_PER_MONTH = [30, 31]
-        DAYS_PER_YEAR = [365, 366]
-
-        s_per_year_0 = (
-            SECONDS_PER_MINUTE * MINUTES_PER_HOUR * HOURS_PER_DAY * DAYS_PER_YEAR[0]
-        )
-        s_per_year_1 = (
-            SECONDS_PER_MINUTE * MINUTES_PER_HOUR * HOURS_PER_DAY * DAYS_PER_YEAR[1]
-        )
-        s_per_month_30 = (
-            SECONDS_PER_MINUTE * MINUTES_PER_HOUR * HOURS_PER_DAY * DAYS_PER_MONTH[0]
-        )
-        s_per_month_31 = (
-            SECONDS_PER_MINUTE * MINUTES_PER_HOUR * HOURS_PER_DAY * DAYS_PER_MONTH[1]
-        )
-        s_per_day = SECONDS_PER_MINUTE * MINUTES_PER_HOUR * HOURS_PER_DAY
-        s_per_hr = SECONDS_PER_MINUTE * MINUTES_PER_HOUR
 
         # take differences to convert to timedeltas
         time_differences = times - initial_time
         time_differences = time_differences.apply(lambda t: t.total_seconds())
 
-        if time_diff % s_per_year_0 == 0:
-            logger.debug("granularity is years")
-            time_differences = [x / s_per_year_0 for x in time_differences]
-        elif time_diff % s_per_year_1 == 0:
-            logger.debug("granularity is years")
-            time_differences = [x / s_per_year_1 for x in time_differences]
-
-        elif time_diff % s_per_month_31 == 0:
-            logger.debug("granularity is months 31")
-            time_differences = [x / s_per_month_31 for x in time_differences]
-        elif time_diff % s_per_month_30 == 0:
-            logger.debug("granularity is months 30")
-            time_differences = [x / s_per_month_30 for x in time_differences]
-
-        elif time_diff % s_per_day == 0:
-            logger.debug("granularity is days")
-            time_differences = [x / s_per_day for x in time_differences]
-
-        elif time_diff % s_per_hr == 0:
-            logger.debug("granularity is hours")
-            time_differences = [x / s_per_hr for x in time_differences]
-
-        elif time_diff % SECONDS_PER_MINUTE == 0:
-            logger.debug("granularity is seconds")
-            time_differences = [x / SECONDS_PER_MINUTE for x in time_differences]
-
-        return time_differences
+        if frequency == 'YS':
+            return [round(x / S_PER_YEAR_0) for x in time_differences]
+        elif frequency == 'M':
+            return [round(x / S_PER_MONTH_30) for x in time_differences]
+        elif frequency == 'W':
+            return [round(x / S_PER_WEEK) for x in time_differences]
+        elif frequency == 'D':
+            return [round(x / S_PER_DAY) for x in time_differences]
+        elif frequency == 'H':
+            return [round(x / S_PER_HR) for x in time_differences]
+        else:
+            return [round(x / SECONDS_PER_MINUTE) for x in time_differences]
 
     def produce(
         self, *, inputs: Inputs, timeout: float = None, iterations: int = None
@@ -614,66 +659,87 @@ class VAR(SupervisedLearnerPrimitiveBase[Inputs, Outputs, Params, Hyperparams]):
             CallResult[Outputs] -- (N, 2) dataframe with d3m_index and value for each prediction slice requested.
                 prediction slice = specific horizon idx for specific series in specific regression 
         """
-
         if not self._is_fit:
             raise PrimitiveNotFittedError("Primitive not fitted.")
 
+        # make copy of input data!
+        inputs_copy = inputs.copy()
+
         # if datetime columns are integers, parse as # of days
         if self.integer_time:
-            inputs[self.time_column] = pd.to_datetime(
-                inputs[self.time_column] - 1, unit="D"
+            inputs_copy[self.time_column] = pd.to_datetime(
+                inputs_copy[self.time_column] - 1, unit="D"
             )
         else:
-            inputs[self.time_column] = pd.to_datetime(
-                inputs[self.time_column], unit="s"
+            inputs_copy[self.time_column] = pd.to_datetime(
+                inputs_copy[self.time_column], unit="s"
             )
 
+        # sort by time column
+        inputs_copy = inputs_copy.sort_values(by = [self.time_column])
+
         # intelligently calculate grouping key order - by highest number of unique vals after grouping
-        grouping_keys = inputs.metadata.get_columns_with_semantic_type(
+        grouping_keys = inputs_copy.metadata.get_columns_with_semantic_type(
             "https://metadata.datadrivendiscovery.org/types/SuggestedGroupingKey"
         )
 
         # groupby learned filter_idxs and extract n_periods, interval and d3mIndex information
         n_periods, intervals, d3m_indices = self._calculate_prediction_intervals(
-            inputs, len(grouping_keys)
+            inputs_copy, len(grouping_keys)
         )
 
         # produce future forecast using VAR / ARMA
         future_forecasts = [
-            fit.forecast(y = vals[-fit.k_ar:], 
+            fit.forecast(y = vals[vals.shape[0]-fit.k_ar:], 
                 steps = n)
             if lags is not None and lags > 0
-            else np.repeat(fit.params, horizon, axis = 0)
+            else np.repeat(fit.params, n, axis = 0)
             if lags == 0 
-            else fit.predict(n_periods = n)
+            else fit.predict(n_periods = n).reshape(-1,1)
             for fit, vals, lags, n in zip(
-                self._fits, self._values, self._lag_order, n_periods
+                self._fits, self._values_diff, self._lag_order, n_periods
             )
         ]
 
-        # undo differencing transformations
+        # prepend in-sample predictions
         future_forecasts = [
-            np.exp(future_forecast.cumsum(axis=0) + final_logs).T
-            if len(future_forecast.shape) is 1
-            else np.exp(future_forecast.cumsum(axis=0) + final_logs)
-            for future_forecast, final_logs in zip(future_forecasts, self._final_logs)
+            np.concatenate((vals[-1:], vals_diff[-1:], fit.predict_in_sample().reshape(-1,1), pred), axis = 0)
+            if lags is None
+            else np.concatenate((vals[-1:], vals_diff[len(vals_diff)-lags:], fit.fittedvalues, pred), axis = 0)
+            for fit, pred, lags, vals, vals_diff
+            in zip(self._fits, future_forecasts, self._lag_order, self._values, self._values_diff)
         ]
+
+        # undo differencing transformation, convert to df
+        future_forecasts = [pd.DataFrame(future_forecast.cumsum(axis=0)) for future_forecast in future_forecasts]
+
+        # apply invariances (real, positive data AND rounding NA / INF values)
         future_forecasts = [
-            pd.DataFrame(future_forecast) for future_forecast in future_forecasts
+            f.clip(lower = 0).replace(np.inf, np.nan)
+            if not positive 
+            else f.replace(np.inf, np.nan)
+            for f, positive in zip(future_forecasts, self._positive)
         ]
-        future_forecasts = [
-            future_forecast.apply(lambda x: x + minimum - 1)
-            for future_forecast, minimum in zip(future_forecasts, self._mins)
-        ]
+        future_forecasts = [f.fillna(f.mean()) for f in future_forecasts]
 
         # select predictions to return based on intervals
         key_names = [list(inputs)[k] for k in self.key]
         var_df = pd.DataFrame([], columns=key_names + self._targets)
+
         for forecast, interval, idxs in zip(future_forecasts, intervals, d3m_indices):
-            for row, col, d3m_idx in zip(interval, range(len(interval)), idxs):
-                for r, i in zip(row, d3m_idx):
-                    cols = [col + t for t in self.target_indices]
-                    var_df.loc[var_df.shape[0]] = [i, *forecast.iloc[r][cols].values]
+            #logger.debug(f'forecast shape: {forecast.shape}')
+            if interval is not None:
+                for row, col, d3m_idx in zip(interval, range(len(interval)), idxs):
+                    # if new col in test (endogenous variable), average over all other cols
+                    if col >= forecast.shape[1]:
+                        #logger.debug('Needed new forecast column!')
+                        preds = forecast.mean(axis = 1).replace(np.inf, MAX_INT)
+                        preds = pd.concat([preds] * len(self.target_indices), axis=1)
+                    else:
+                        cols = [col + t for t in self.target_indices]
+                        preds = forecast[cols]
+                    for r, i in zip(row, d3m_idx):
+                        var_df.loc[var_df.shape[0]] = [i, *preds.iloc[r].values]
         var_df = d3m_DataFrame(var_df)
         var_df.iloc[:, 0] = var_df.iloc[:, 0].astype(int)
 
@@ -830,7 +896,7 @@ class VAR(SupervisedLearnerPrimitiveBase[Inputs, Outputs, Params, Hyperparams]):
 
         # produce confidence interval forecasts using VAR / ARIMA
         confidence_intervals = []
-        for fit, vals, lags in zip(self._fits, self._values, self._lag_order):
+        for fit, vals, lags in zip(self._fits, self._values_diff, self._lag_order):
             if lags is not None and lags > 0:
                 confidence_intervals.append(
                     fit.forecast_interval(y = vals[-fit.k_ar:], 
@@ -855,10 +921,10 @@ class VAR(SupervisedLearnerPrimitiveBase[Inputs, Outputs, Params, Hyperparams]):
         # undo differencing transformations
         confidence_intervals = [
             [
-                np.exp(point_estimate.cumsum(axis=0) + final_logs) + min - 1
+                point_estimate.cumsum(axis=0) + vals[-1:, ]
                 for point_estimate in interval
             ]
-            for interval, final_logs, min in zip(confidence_intervals, self._final_logs, self._mins)
+            for interval, vals in zip(confidence_intervals, self._values)
         ]
 
         # combine into long form df
@@ -884,6 +950,16 @@ class VAR(SupervisedLearnerPrimitiveBase[Inputs, Outputs, Params, Hyperparams]):
             )
             for interval, names in zip(confidence_intervals, series_names)
         ]
+
+        # apply invariances (real, positive data AND rounding NA / INF values)
+        confidence_intervals = [
+            ci.clip(lower = 0).replace(np.inf, np.nan)
+            if not positive 
+            else ci.replace(np.inf, np.nan)
+            for ci, positive in zip(confidence_intervals, self._positive)
+        ]
+        confidence_intervals = [ci.fillna(ci.mean()) for ci in confidence_intervals]
+
         interval_df = pd.concat(confidence_intervals)
 
         # add index column
